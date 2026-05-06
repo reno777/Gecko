@@ -139,72 +139,90 @@ def download(result: SearchResult, dest_path: str) -> None:
     _romsgames_download(result, dest_path)
 
 
+_DOWNLOAD_SELECTORS = [
+    "a:has-text('Download')",
+    "button:has-text('Download')",
+    ".download-btn",
+    "a.download",
+    "[data-action='download']",
+    "a[href*='download']",
+]
+
+
+def _attach_response_watcher(page, bucket: list[str]) -> None:
+    """Append any ROM file URLs seen in network responses to *bucket*."""
+    def on_response(response) -> None:
+        url = response.url
+        if any(url.lower().endswith(ext) for ext in _ROM_EXTENSIONS):
+            bucket.append(url)
+    page.on("response", on_response)
+
+
+def _find_download_btn(page):
+    for sel in _DOWNLOAD_SELECTORS:
+        btn = page.query_selector(sel)
+        if btn:
+            return btn
+    return None
+
+
+def _save_from_url(url: str, dest_path: str) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp, open(dest_path, "wb") as f:
+        while chunk := resp.read(1 << 20):
+            f.write(chunk)
+
+
 def _romsgames_download(result: SearchResult, dest_path: str) -> None:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
             context = browser.new_context(accept_downloads=True)
+            direct_urls: list[str] = []
+
             page = context.new_page()
+            _attach_response_watcher(page, direct_urls)
 
-            # Watch responses for a direct file URL before we touch any buttons
-            direct_url: list[str] = []
+            # Every new tab that opens is an ad popup — close it immediately.
+            context.on("page", lambda pg: pg.close())
 
-            def on_response(response) -> None:
-                url = response.url
-                if (
-                    any(url.lower().endswith(ext) for ext in _ROM_EXTENSIONS)
-                    and response.status == 200
-                ):
-                    direct_url.append(url)
-
-            page.on("response", on_response)
             page.goto(result.url, wait_until="networkidle")
 
-            if direct_url:
-                urllib.request.urlretrieve(direct_url[0], dest_path)
+            if direct_urls:
+                _save_from_url(direct_urls[0], dest_path)
                 return
 
-            # Try common download button patterns in priority order
-            download_selectors = [
-                "a:has-text('Download')",
-                "button:has-text('Download')",
-                ".download-btn",
-                "a.download",
-                "[data-action='download']",
-                "a[href*='download']",
-            ]
-
-            btn = None
-            for selector in download_selectors:
-                candidate = page.query_selector(selector)
-                if candidate:
-                    btn = candidate
-                    break
-
+            btn = _find_download_btn(page)
             if btn is None:
                 raise RuntimeError(
-                    f"Could not locate a download button on {result.url}. "
+                    f"No download button found on {result.url}. "
                     "The site layout may have changed."
                 )
 
-            with context.expect_page() as new_page_info:
-                btn.click()
+            # Each click opens an ad tab (auto-closed above). After several
+            # clicks a countdown appears on the main page and the download
+            # fires automatically when it expires. Keep expect_download open
+            # for the whole sequence so it catches the event whenever it fires.
+            try:
+                with page.expect_download(timeout=90_000) as dl_info:
+                    for _ in range(3):
+                        btn = _find_download_btn(page) or btn
+                        btn.click()
+                        page.wait_for_timeout(1_500)
+                dl_info.value.save_as(dest_path)
+                return
+            except PWTimeout:
+                pass
 
-            # Some sites open a new tab that triggers the download
-            new_page = new_page_info.value
-            new_page.wait_for_load_state("domcontentloaded")
-
-            # Re-check for a direct URL that appeared after the click
-            if direct_url:
-                urllib.request.urlretrieve(direct_url[0], dest_path)
+            if direct_urls:
+                _save_from_url(direct_urls[0], dest_path)
                 return
 
-            # Last resort: wait for Playwright's built-in download event
-            with new_page.expect_download(timeout=60_000) as dl_info:
-                pass
-            dl_info.value.save_as(dest_path)
-
+            raise RuntimeError(
+                f"Could not download from {result.url}. "
+                "The site's download flow may have changed."
+            )
         finally:
             browser.close()
