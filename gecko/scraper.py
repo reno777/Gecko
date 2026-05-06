@@ -143,10 +143,13 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     return results
 
 
-def download(result: SearchResult, dest_path: str, headless: bool = True) -> None:
-    """Navigate to result.url with Playwright and save the ROM to dest_path."""
+def download(result: SearchResult, dest_path: str, headless: bool = True) -> str:
+    """
+    Download result to disk. Returns the actual path saved, which may have a
+    different extension than dest_path if the site serves a zip/7z archive.
+    """
     _check_browser()
-    _romsgames_download(result, dest_path, headless=headless)
+    return _romsgames_download(result, dest_path, headless=headless)
 
 
 def _attach_response_watcher(page, bucket: list[str]) -> None:
@@ -172,14 +175,41 @@ def _find_download_locator(page) -> tuple[Any, str] | tuple[None, None]:
     return None, None
 
 
-def _save_from_url(url: str, dest_path: str) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req) as resp, open(dest_path, "wb") as f:
-        while chunk := resp.read(1 << 20):
-            f.write(chunk)
+def _stream_download(url: str, dest_path: str, extra_headers: dict | None = None) -> str:
+    """Download *url* to *dest_path* with a Rich progress bar. Returns dest_path."""
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        TextColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+    )
+
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req) as resp:
+        total = int(resp.headers.get("Content-Length", 0)) or None
+        with Progress(
+            TextColumn("[cyan]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(pathlib.Path(dest_path).name, total=total)
+            with open(dest_path, "wb") as f:
+                while chunk := resp.read(65536):
+                    f.write(chunk)
+                    progress.advance(task, len(chunk))
+
+    return dest_path
 
 
-def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = True) -> None:
+def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = True) -> str:
     from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 
     with sync_playwright() as p:
@@ -194,8 +224,7 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             page.goto(result.url, wait_until="load")
 
             if direct_urls:
-                _save_from_url(direct_urls[0], dest_path)
-                return
+                return _stream_download(direct_urls[0], dest_path)
 
             loc, matched_sel = _find_download_locator(page)
             if loc is None:
@@ -213,28 +242,43 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             #   click 2 → 2 ad tabs open simultaneously
             #   close all ad tabs → countdown appears on the main page
             #   countdown expires → download fires on the main page
-            #
-            # We keep expect_download open across both clicks so it catches
-            # the download event whenever the countdown finishes.
             try:
                 with page.expect_download(timeout=90_000) as dl_info:
-                    for click_num in range(2):
+                    for _ in range(2):
                         loc.click()
-                        # Wait for ad tabs to fully open before closing them
                         page.wait_for_timeout(2_000)
                         for pg in context.pages[1:]:
                             pg.close()
                         page.wait_for_timeout(500)
-                    # Countdown is now running on the main page.
-                    # expect_download will block here until the file arrives.
-                dl_info.value.save_as(dest_path)
-                return
+
+                dl = dl_info.value
+
+                # Use suggested_filename to get the real extension (may be .zip, .7z, etc.)
+                suggested = dl.suggested_filename
+                if suggested:
+                    actual_path = str(pathlib.Path(dest_path).with_suffix(pathlib.Path(suggested).suffix))
+                else:
+                    actual_path = dest_path
+
+                # Prefer streaming directly from the URL for speed + progress.
+                # dl.url is the real file URL; fall back to Playwright save_as only
+                # if it's a blob or internal URL.
+                file_url = direct_urls[0] if direct_urls else dl.url
+                if file_url and not file_url.startswith("blob:"):
+                    cookies = context.cookies()
+                    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                    return _stream_download(
+                        file_url,
+                        actual_path,
+                        extra_headers={"Referer": result.url, "Cookie": cookie_str},
+                    )
+
+                # Blob URL or unknown — let Playwright save it and show a fallback message
+                dl.save_as(actual_path)
+                return actual_path
+
             except PWTimeout:
                 pass
-
-            if direct_urls:
-                _save_from_url(direct_urls[0], dest_path)
-                return
 
             raise RuntimeError(
                 f"Could not download from {result.url}. "

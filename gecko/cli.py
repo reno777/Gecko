@@ -153,17 +153,17 @@ def _fetch_one(
     table.add_row("[dim]Size[/]", f"{best.size_mb:.0f} MB" if best.size_mb else "unknown")
     console.print(table)
 
-    # 6. Download
+    # 6. Download — scraper renders its own progress bar
     stem = best.title.replace("/", "-")
     dl_path = out_dir / f"{stem}.{source_fmt}"
-    with console.status(f"Downloading to [bold]{dl_path.name}[/]..."):
-        scraper.download(best, str(dl_path), headless=not debug)
-    console.print(f"[green]Downloaded:[/] {dl_path}")
+    actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
+    console.print(f"[green]Downloaded:[/] {actual_dl_path}")
 
-    # 7. Convert if needed
-    if source_fmt != desired_fmt:
+    # 7. Convert if needed (use actual downloaded path, which may differ in extension)
+    actual_source_fmt = actual_dl_path.suffix.lstrip(".")
+    if actual_source_fmt != desired_fmt:
         final_path = out_dir / f"{stem}.{desired_fmt}"
         with console.status(f"Converting to [bold]{desired_fmt}[/]..."):
-            converter.convert(str(dl_path), str(final_path), desired_fmt)
-        converter.cleanup(str(dl_path))
+            converter.convert(str(actual_dl_path), str(final_path), desired_fmt)
+        converter.cleanup(str(actual_dl_path))
         console.print(f"[green]Converted:[/] {final_path}")
