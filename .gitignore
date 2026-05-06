@@ -35,3 +35,6 @@ htmlcov/
 
 # Playwright
 playwright/.auth/
+
+# Test output
+temp/
