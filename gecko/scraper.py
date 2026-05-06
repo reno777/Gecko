@@ -191,7 +191,7 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             page = context.new_page()
             _attach_response_watcher(page, direct_urls)
 
-            page.goto(result.url, wait_until="networkidle")
+            page.goto(result.url, wait_until="load")
 
             if direct_urls:
                 _save_from_url(direct_urls[0], dest_path)
