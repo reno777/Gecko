@@ -159,7 +159,14 @@ def _fetch_one(
     actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
     console.print(f"[green]Downloaded:[/] {actual_dl_path}")
 
-    # 7. Convert if needed (use actual downloaded path, which may differ in extension)
+    # 7. Extract archive if needed (zip/7z → actual ROM file)
+    if converter.is_archive(str(actual_dl_path)):
+        extracted_path = pathlib.Path(converter.extract_archive(str(actual_dl_path), str(out_dir)))
+        converter.cleanup(str(actual_dl_path))
+        console.print(f"[green]Extracted:[/] {extracted_path}")
+        actual_dl_path = extracted_path
+
+    # 8. Convert if needed (e.g. rvz → iso via dolphintool)
     actual_source_fmt = actual_dl_path.suffix.lstrip(".")
     if actual_source_fmt != desired_fmt:
         final_path = out_dir / f"{stem}.{desired_fmt}"

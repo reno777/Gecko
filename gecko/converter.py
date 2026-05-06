@@ -10,8 +10,10 @@ Binaries are bundled under gecko/bin/ and named:
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -59,6 +61,77 @@ def convert(input_path: str, output_path: str, output_fmt: str) -> None:
     tool = get_dolphintool_path()
     cmd = [str(tool), "convert", "-i", input_path, "-o", output_path, "-f", output_fmt]
     subprocess.run(cmd, check=True)
+
+
+_ARCHIVE_EXTS = {".zip", ".7z", ".rar"}
+_ROM_EXTS = {".iso", ".rvz", ".gcz", ".nds", ".gba", ".sfc", ".smc", ".n64", ".z64"}
+
+
+def is_archive(path: str) -> bool:
+    return Path(path).suffix.lower() in _ARCHIVE_EXTS
+
+
+def extract_archive(archive_path: str, dest_dir: str) -> str:
+    """
+    Extract the ROM file from a zip or 7z archive into dest_dir.
+    Returns the path of the extracted ROM file.
+
+    For zip: uses stdlib zipfile.
+    For 7z: requires py7zr (pip install py7zr).
+    """
+    from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn, TransferSpeedColumn
+
+    archive = Path(archive_path)
+    dest = Path(dest_dir)
+    ext = archive.suffix.lower()
+
+    def _pick_rom(names: list[str]) -> str:
+        # Prefer files with known ROM extensions; fall back to the largest by name length
+        rom_names = [n for n in names if Path(n).suffix.lower() in _ROM_EXTS]
+        return (rom_names or names)[0]
+
+    if ext == ".zip":
+        with zipfile.ZipFile(archive) as zf:
+            members = zf.infolist()
+            target_name = _pick_rom([m.filename for m in members])
+            target = next(m for m in members if m.filename == target_name)
+            out_path = dest / Path(target.filename).name
+            with Progress(
+                TextColumn("[cyan]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(f"Extracting {out_path.name}", total=target.file_size)
+                with zf.open(target) as src, open(out_path, "wb") as dst:
+                    while chunk := src.read(65536):
+                        dst.write(chunk)
+                        progress.advance(task, len(chunk))
+        return str(out_path)
+
+    if ext == ".7z":
+        try:
+            import py7zr
+        except ImportError:
+            raise RuntimeError(
+                "py7zr is required to extract .7z archives.\n"
+                "Run:  pip install py7zr"
+            )
+        with py7zr.SevenZipFile(archive, mode="r") as zf:
+            names = zf.getnames()
+            target_name = _pick_rom(names)
+            out_path = dest / Path(target_name).name
+            zf.extract(dest, targets=[target_name])
+            # py7zr may create subdirectories — find the extracted file
+            extracted = dest / target_name
+            if extracted != out_path:
+                shutil.move(str(extracted), str(out_path))
+        return str(out_path)
+
+    raise NotImplementedError(
+        f"Archive format '{ext}' is not supported. Supported: .zip, .7z"
+    )
 
 
 def needs_conversion(available_fmt: str, desired_fmt: str) -> bool:
