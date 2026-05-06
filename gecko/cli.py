@@ -1,5 +1,7 @@
+import queue
 import re
 import sys
+import threading
 
 if sys.version_info < (3, 11):
     sys.exit(
@@ -185,8 +187,52 @@ def fetch(
     out_dir = pathlib.Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for game_name in game_names:
-        _fetch_one(game_name, platform_name, resolved_fmt, revision, out_dir, debug=debug)
+    # Single game: run directly with no queue overhead
+    if len(game_names) == 1:
+        _fetch_one(game_names[0], platform_name, resolved_fmt, revision, out_dir, debug=debug)
+        return
+
+    # Multiple games: print the queue up front, then process one at a time
+    # in a worker thread so all jobs are committed before any download starts.
+    console.print(f"[bold]Queued {len(game_names)} games:[/]")
+    for i, name in enumerate(game_names, 1):
+        console.print(f"  [dim]{i}.[/] {name}")
+    console.print()
+
+    job_queue: queue.Queue[str] = queue.Queue()
+    for name in game_names:
+        job_queue.put(name)
+
+    completed: list[str] = []
+    failed: list[str] = []
+
+    def _worker() -> None:
+        while True:
+            try:
+                game_name = job_queue.get(timeout=0.1)
+            except queue.Empty:
+                break
+            try:
+                _fetch_one(game_name, platform_name, resolved_fmt, revision, out_dir, debug=debug)
+                completed.append(game_name)
+            except Exception as exc:
+                console.print(f"[red]Failed:[/] {game_name} — {exc}")
+                failed.append(game_name)
+            finally:
+                job_queue.task_done()
+
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+    worker_thread.join()
+
+    # Summary after all jobs finish
+    total = len(game_names)
+    console.rule()
+    console.print(f"[bold]Queue complete.[/] {len(completed)}/{total} succeeded.")
+    if failed:
+        console.print("[red]Failed:[/]")
+        for name in failed:
+            console.print(f"  [red]✗[/] {name}")
 
 
 def _fetch_one(
