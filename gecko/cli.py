@@ -2,6 +2,7 @@ import queue
 import re
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if sys.version_info < (3, 11):
     sys.exit(
@@ -37,6 +38,142 @@ def _print_banner() -> None:
     console.print(_TITLE, style="bold green")
     console.print(" [dim]ROM Downloader  •  v0.1.0  •  by Reno[/]\n")
 
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def _sanitize_stem(title: str) -> str:
+    """Strip characters that are illegal in filenames on Windows/macOS (e.g. colons)."""
+    return re.sub(r'[\\/:*?"<>|]', "-", title).strip()
+
+
+def _find_best(
+    game_name: str,
+    platform_name: str,
+    desired_fmt: str,
+    revision_override: int | None,
+) -> tuple[scraper.SearchResult, str] | None:
+    """
+    Silent search + selection — safe to call from multiple threads simultaneously.
+
+    Runs the full region/format/revision filter pipeline and returns
+    (best_result, source_fmt) or None if no suitable ROM was found.
+    Intentionally produces no console output so concurrent calls don't interleave.
+    """
+    platform = get_platform(platform_name)
+    results = scraper.search(platform_name, game_name)
+    if not results:
+        return None
+
+    # Prefer USA releases; fall back to any region if none exist
+    usa_results = [r for r in results if is_usa(r.title)]
+    if not usa_results:
+        usa_results = results
+
+    # Find results in the desired format, or fall back to a convertible source
+    source_fmt = desired_fmt
+    format_results = [r for r in usa_results if r.fmt == desired_fmt]
+    if not format_results and desired_fmt in platform.conversions:
+        source_fmt = platform.conversions[desired_fmt]
+        format_results = [r for r in usa_results if r.fmt == source_fmt]
+    if not format_results:
+        return None
+
+    # Pin to a specific revision if requested; fall back to best available if not found
+    if revision_override is not None:
+        rev_tag = f"(Rev {revision_override})"
+        rev_results = [r for r in format_results if rev_tag in r.title]
+        rev_results = rev_results or format_results
+    else:
+        rev_results = format_results
+
+    # Sort by region score first (exact USA wins), then revision priority
+    rev_results.sort(key=lambda r: (region_score(r.title), revision_priority(r.title)))
+    return rev_results[0], source_fmt
+
+
+def _download_one(
+    game_name: str,
+    best: scraper.SearchResult,
+    source_fmt: str,
+    desired_fmt: str,
+    out_dir: pathlib.Path,
+    debug: bool = False,
+) -> None:
+    """
+    Download, extract, and convert a single resolved ROM.
+    Prints a progress header and status updates. Called sequentially by the queue worker.
+    """
+    console.rule(f"[bold]{game_name}")
+
+    # Inform the user when a conversion will happen after download
+    if source_fmt != desired_fmt:
+        console.print(
+            f"[yellow]'{desired_fmt}' not directly available.[/] "
+            f"Will download [bold]{source_fmt}[/] and convert."
+        )
+
+    # Inform the user when a non-Rev-1 revision was automatically chosen
+    rev_match = re.search(r"\(Rev (\d+)\)", best.title, re.IGNORECASE)
+    if rev_match and rev_match.group(1) != "1":
+        console.print(
+            f"[dim]Auto-selected revision {rev_match.group(1)} (Rev 1 not available).[/]"
+        )
+
+    # Show a summary of what was selected before downloading
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    table.add_row("[dim]Selected[/]", best.title)
+    table.add_row("[dim]Format[/]", source_fmt)
+    table.add_row("[dim]Size[/]", f"{best.size_mb:.0f} MB" if best.size_mb else "unknown")
+    console.print(table)
+
+    # Sanitize the filename — colons and other special chars break paths on some systems
+    stem = _sanitize_stem(best.title)
+    dl_path = out_dir / f"{stem}.{source_fmt}"
+
+    # Download — scraper streams the file and renders its own progress bar
+    actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
+    console.print(f"[green]Downloaded:[/] {actual_dl_path}")
+
+    # Extract archive if needed — ROM sites often wrap files in zip or 7z
+    if converter.is_archive(str(actual_dl_path)):
+        extracted_path = pathlib.Path(converter.extract_archive(str(actual_dl_path), str(out_dir)))
+        converter.cleanup(str(actual_dl_path))
+        console.print(f"[green]Extracted:[/] {extracted_path}")
+        actual_dl_path = extracted_path
+
+    # Convert to the desired format if the downloaded file differs (e.g. rvz → iso)
+    actual_source_fmt = actual_dl_path.suffix.lstrip(".")
+    if actual_source_fmt != desired_fmt:
+        final_path = out_dir / f"{stem}.{desired_fmt}"
+        with console.status(f"Converting to [bold]{desired_fmt}[/]..."):
+            converter.convert(str(actual_dl_path), str(final_path), desired_fmt)
+        converter.cleanup(str(actual_dl_path))
+        console.print(f"[green]Converted:[/] {final_path}")
+
+
+def _fetch_one(
+    game_name: str,
+    platform_name: str,
+    desired_fmt: str,
+    revision_override: int | None,
+    out_dir: pathlib.Path,
+    debug: bool = False,
+) -> None:
+    """Single-game pipeline: search with a spinner, then download."""
+    console.rule(f"[bold]{game_name}")
+
+    with console.status(f"Searching for [bold]{game_name}[/]..."):
+        match = _find_best(game_name, platform_name, desired_fmt, revision_override)
+
+    if match is None:
+        console.print(f"[red]No results found for '{game_name}'.[/]")
+        return
+
+    best, source_fmt = match
+    _download_one(game_name, best, source_fmt, desired_fmt, out_dir, debug=debug)
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 @click.group(context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
@@ -187,154 +324,83 @@ def fetch(
     out_dir = pathlib.Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Single game: run directly with no queue overhead
+    # Single game: run the pipeline directly with no queue overhead
     if len(game_names) == 1:
         _fetch_one(game_names[0], platform_name, resolved_fmt, revision, out_dir, debug=debug)
         return
 
-    # Multiple games: print the queue up front, then process one at a time
-    # in a worker thread so all jobs are committed before any download starts.
-    console.print(f"[bold]Queued {len(game_names)} games:[/]")
-    for i, name in enumerate(game_names, 1):
-        console.print(f"  [dim]{i}.[/] {name}")
-    console.print()
+    # ── Multi-game: concurrent search → queued downloads ──────────────────────
+    #
+    # Phase 1: search for all games at the same time using a thread pool.
+    #   Each search runs in its own thread so the catalogue lookups overlap.
+    #   No console output is produced during this phase to avoid interleaving.
+    #
+    # Phase 2: feed every resolved result into a queue and process downloads
+    #   one at a time with a single worker thread.
 
-    job_queue: queue.Queue[str] = queue.Queue()
-    for name in game_names:
-        job_queue.put(name)
+    console.print(f"[bold]Searching for {len(game_names)} games...[/]\n")
+
+    download_queue: queue.Queue[tuple[str, scraper.SearchResult, str]] = queue.Queue()
+    search_failed: list[str] = []
+
+    # Cap concurrency at 6 — each search launches a headless browser
+    with ThreadPoolExecutor(max_workers=min(len(game_names), 6)) as pool:
+        future_to_name = {
+            pool.submit(_find_best, name, platform_name, resolved_fmt, revision): name
+            for name in game_names
+        }
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                console.print(f"  [red]✗[/] {name} — {exc}")
+                search_failed.append(name)
+                continue
+
+            if result is None:
+                console.print(f"  [red]✗[/] {name} — not found")
+                search_failed.append(name)
+            else:
+                best, source_fmt = result
+                console.print(f"  [green]✓[/] {name} → {best.title}")
+                download_queue.put((name, best, source_fmt))
+
+    if download_queue.empty():
+        console.print("\n[red]No games found to download.[/]")
+        return
+
+    queued = download_queue.qsize()
+    console.print(f"\n[bold]Starting download queue ({queued} game(s))...[/]\n")
 
     completed: list[str] = []
-    failed: list[str] = []
+    download_failed: list[str] = []
 
     def _worker() -> None:
         while True:
             try:
-                game_name = job_queue.get(timeout=0.1)
+                game_name, best, source_fmt = download_queue.get(timeout=0.1)
             except queue.Empty:
                 break
             try:
-                _fetch_one(game_name, platform_name, resolved_fmt, revision, out_dir, debug=debug)
+                _download_one(game_name, best, source_fmt, resolved_fmt, out_dir, debug=debug)
                 completed.append(game_name)
             except Exception as exc:
                 console.print(f"[red]Failed:[/] {game_name} — {exc}")
-                failed.append(game_name)
+                download_failed.append(game_name)
             finally:
-                job_queue.task_done()
+                download_queue.task_done()
 
     worker_thread = threading.Thread(target=_worker, daemon=True)
     worker_thread.start()
     worker_thread.join()
 
-    # Summary after all jobs finish
+    # Final summary
     total = len(game_names)
+    all_failed = search_failed + download_failed
     console.rule()
-    console.print(f"[bold]Queue complete.[/] {len(completed)}/{total} succeeded.")
-    if failed:
+    console.print(f"[bold]Done.[/] {len(completed)}/{total} succeeded.")
+    if all_failed:
         console.print("[red]Failed:[/]")
-        for name in failed:
+        for name in all_failed:
             console.print(f"  [red]✗[/] {name}")
-
-
-def _fetch_one(
-    game_name: str,
-    platform_name: str,
-    desired_fmt: str,
-    revision_override: int | None,
-    out_dir: pathlib.Path,
-    debug: bool = False,
-) -> None:
-    """Run the full search → download → extract → convert pipeline for a single game."""
-    platform = get_platform(platform_name)
-
-    console.rule(f"[bold]{game_name}")
-
-    # 1. Search the ROM site for candidate matches
-    with console.status(f"Searching for [bold]{game_name}[/]..."):
-        results = scraper.search(platform_name, game_name)
-
-    if not results:
-        console.print(f"[red]No results found for '{game_name}'.[/]")
-        return
-
-    # 2. Region filter — prefer USA releases; warn and fall back if none found
-    usa_results = [r for r in results if is_usa(r.title)]
-    if not usa_results:
-        console.print(
-            f"[yellow]Warning:[/] No USA release found for '{game_name}'. "
-            "Falling back to first available region."
-        )
-        usa_results = results
-    elif len(usa_results) < len(results):
-        skipped = len(results) - len(usa_results)
-        console.print(f"[dim]Filtered out {skipped} non-USA result(s).[/]")
-
-    # 3. Format filter — find results in the desired format, or a convertible source
-    source_fmt = desired_fmt
-    format_results = [r for r in usa_results if r.fmt == desired_fmt]
-    if not format_results and desired_fmt in platform.conversions:
-        source_fmt = platform.conversions[desired_fmt]
-        format_results = [r for r in usa_results if r.fmt == source_fmt]
-        if format_results:
-            console.print(
-                f"[yellow]'{desired_fmt}' not directly available.[/] "
-                f"Will download [bold]{source_fmt}[/] and convert."
-            )
-    if not format_results:
-        console.print(
-            f"[red]No '{desired_fmt}' (or convertible) results found for '{game_name}'.[/]"
-        )
-        return
-
-    # 4. Revision selection — pin to requested revision or sort by priority
-    if revision_override is not None:
-        rev_tag = f"(Rev {revision_override})"
-        rev_results = [r for r in format_results if rev_tag in r.title]
-        if not rev_results:
-            console.print(
-                f"[yellow]Revision {revision_override} not found; "
-                "using best available revision.[/]"
-            )
-            rev_results = format_results
-    else:
-        rev_results = format_results
-
-    # Sort by region score first (exact USA wins), then revision priority
-    rev_results.sort(key=lambda r: (region_score(r.title), revision_priority(r.title)))
-    best = rev_results[0]
-
-    # Inform the user if a non-Rev-1 revision was automatically chosen
-    rev_match = re.search(r"\(Rev (\d+)\)", best.title, re.IGNORECASE)
-    if rev_match and rev_match.group(1) != "1":
-        console.print(
-            f"[dim]Auto-selected revision {rev_match.group(1)} "
-            f"(Rev 1 not available).[/]"
-        )
-
-    # 5. Show a summary of the selected ROM before downloading
-    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
-    table.add_row("[dim]Selected[/]", best.title)
-    table.add_row("[dim]Format[/]", source_fmt)
-    table.add_row("[dim]Size[/]", f"{best.size_mb:.0f} MB" if best.size_mb else "unknown")
-    console.print(table)
-
-    # 6. Download — the scraper streams the file and renders its own progress bar
-    stem = best.title.replace("/", "-")
-    dl_path = out_dir / f"{stem}.{source_fmt}"
-    actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
-    console.print(f"[green]Downloaded:[/] {actual_dl_path}")
-
-    # 7. Extract archive if needed — ROM sites often wrap files in zip or 7z
-    if converter.is_archive(str(actual_dl_path)):
-        extracted_path = pathlib.Path(converter.extract_archive(str(actual_dl_path), str(out_dir)))
-        converter.cleanup(str(actual_dl_path))
-        console.print(f"[green]Extracted:[/] {extracted_path}")
-        actual_dl_path = extracted_path
-
-    # 8. Convert to the desired format if the downloaded file differs (e.g. rvz → iso)
-    actual_source_fmt = actual_dl_path.suffix.lstrip(".")
-    if actual_source_fmt != desired_fmt:
-        final_path = out_dir / f"{stem}.{desired_fmt}"
-        with console.status(f"Converting to [bold]{desired_fmt}[/]..."):
-            converter.convert(str(actual_dl_path), str(final_path), desired_fmt)
-        converter.cleanup(str(actual_dl_path))
-        console.print(f"[green]Converted:[/] {final_path}")
