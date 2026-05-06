@@ -23,12 +23,15 @@ _PLATFORM_SLUG: dict[str, str] = {
 _ROM_EXTENSIONS = (".iso", ".rvz", ".gcz", ".zip", ".7z", ".rar")
 
 _DOWNLOAD_SELECTORS = [
-    "a:has-text('Download')",
+    "a:has-text('Save Game')",
+    "button:has-text('Save Game')",
+    "a:has-text('Download ROM')",
+    "a:has-text('Download Now')",
+    "a:has-text('Download'):not([href*='emulator'])",
     "button:has-text('Download')",
     ".download-btn",
     "a.download",
     "[data-action='download']",
-    "a[href*='download']",
 ]
 
 
