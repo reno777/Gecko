@@ -158,11 +158,16 @@ def _attach_response_watcher(page, bucket: list[str]) -> None:
     page.on("response", on_response)
 
 
-def _find_download_btn(page):
+def _find_download_locator(page):
+    """Return a Locator for the first matching download button, or None.
+
+    Locators re-query the DOM on every interaction, so they never go stale
+    after a page re-render (unlike ElementHandle from query_selector).
+    """
     for sel in _DOWNLOAD_SELECTORS:
-        btn = page.query_selector(sel)
-        if btn:
-            return btn
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            return loc
     return None
 
 
@@ -194,8 +199,8 @@ def _romsgames_download(result: SearchResult, dest_path: str) -> None:
                 _save_from_url(direct_urls[0], dest_path)
                 return
 
-            btn = _find_download_btn(page)
-            if btn is None:
+            loc = _find_download_locator(page)
+            if loc is None:
                 raise RuntimeError(
                     f"No download button found on {result.url}. "
                     "The site layout may have changed."
@@ -205,11 +210,12 @@ def _romsgames_download(result: SearchResult, dest_path: str) -> None:
             # clicks a countdown appears on the main page and the download
             # fires automatically when it expires. Keep expect_download open
             # for the whole sequence so it catches the event whenever it fires.
+            # Locator re-queries the DOM on each .click() so it survives the
+            # page re-render that happens when the countdown appears.
             try:
                 with page.expect_download(timeout=90_000) as dl_info:
                     for _ in range(3):
-                        btn = _find_download_btn(page) or btn
-                        btn.click()
+                        loc.click()
                         page.wait_for_timeout(1_500)
                 dl_info.value.save_as(dest_path)
                 return
