@@ -221,7 +221,8 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             page = context.new_page()
             _attach_response_watcher(page, direct_urls)
 
-            page.goto(result.url, wait_until="load")
+            page.goto(result.url, wait_until="domcontentloaded")
+            page.wait_for_timeout(2_000)  # let JS render the download button
 
             if direct_urls:
                 return _stream_download(direct_urls[0], dest_path)
