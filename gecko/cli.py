@@ -18,6 +18,12 @@ from gecko.utils import is_usa, parse_game_list, region_score
 
 console = Console()
 
+def _print_banner() -> None:
+    console.print()
+    console.print("  [bold green]G  E  C  K  O[/]")
+    console.print("  [dim]ROM Downloader  •  v0.1.0  •  by Reno[/]")
+    console.print()
+
 
 @click.group()
 def cli() -> None:
@@ -42,6 +48,8 @@ def fetch(
     games: tuple[str, ...],
 ) -> None:
     """Search and download ROMs for one or more games."""
+
+    _print_banner()
 
     try:
         platform = get_platform(platform_name)

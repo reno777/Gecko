@@ -66,14 +66,35 @@ def convert(input_path: str, output_path: str, output_fmt: str) -> None:
 _ARCHIVE_EXTS = {".zip", ".7z", ".rar"}
 _ROM_EXTS = {".iso", ".rvz", ".gcz", ".nds", ".gba", ".sfc", ".smc", ".n64", ".z64"}
 
+# Magic byte signatures → format string
+_MAGIC: list[tuple[bytes, str]] = [
+    (b"PK\x03\x04", "zip"),
+    (b"PK\x05\x06", "zip"),   # empty zip
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"Rar!\x1a\x07", "rar"),
+    (b"RVZ\x01", "rvz"),
+]
+
+
+def detect_format(path: str) -> str | None:
+    """Return the actual file format detected from magic bytes, or None if unknown."""
+    with open(path, "rb") as f:
+        header = f.read(8)
+    for magic, fmt in _MAGIC:
+        if header[: len(magic)] == magic:
+            return fmt
+    return None
+
 
 def is_archive(path: str) -> bool:
-    return Path(path).suffix.lower() in _ARCHIVE_EXTS
+    """Return True if the file is a known archive format (by content, not extension)."""
+    return detect_format(path) in {"zip", "7z", "rar"}
 
 
 def extract_archive(archive_path: str, dest_dir: str) -> str:
     """
     Extract the ROM file from a zip or 7z archive into dest_dir.
+    Format is detected from file content (magic bytes), not the extension.
     Returns the path of the extracted ROM file.
 
     For zip: uses stdlib zipfile.
@@ -83,14 +104,13 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
 
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    ext = archive.suffix.lower()
+    fmt = detect_format(archive_path)
 
     def _pick_rom(names: list[str]) -> str:
-        # Prefer files with known ROM extensions; fall back to the largest by name length
         rom_names = [n for n in names if Path(n).suffix.lower() in _ROM_EXTS]
         return (rom_names or names)[0]
 
-    if ext == ".zip":
+    if fmt == "zip":
         with zipfile.ZipFile(archive) as zf:
             members = zf.infolist()
             target_name = _pick_rom([m.filename for m in members])
@@ -110,7 +130,7 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
                         progress.advance(task, len(chunk))
         return str(out_path)
 
-    if ext == ".7z":
+    if fmt == "7z":
         try:
             import py7zr
         except ImportError:
@@ -123,14 +143,14 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
             target_name = _pick_rom(names)
             out_path = dest / Path(target_name).name
             zf.extract(dest, targets=[target_name])
-            # py7zr may create subdirectories — find the extracted file
             extracted = dest / target_name
             if extracted != out_path:
                 shutil.move(str(extracted), str(out_path))
         return str(out_path)
 
     raise NotImplementedError(
-        f"Archive format '{ext}' is not supported. Supported: .zip, .7z"
+        f"Unrecognised archive format (magic: {detect_format(archive_path)!r}). "
+        "Supported: .zip, .7z"
     )
 
 

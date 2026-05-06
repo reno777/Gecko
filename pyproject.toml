@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
     "playwright>=1.44",
+    "py7zr>=0.20",
     "rich>=13.0",
 ]
 
