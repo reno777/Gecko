@@ -30,6 +30,7 @@ def cli() -> None:
 @click.option("--list", "game_list", default=None, type=click.Path(exists=True), help="Path to .txt file of game names")
 @click.option("--revision", default=None, type=int, help="Force a specific revision number (e.g. 0, 1)")
 @click.option("--output-dir", default=".", show_default=True, type=click.Path(), help="Directory to save downloaded files")
+@click.option("--debug", is_flag=True, default=False, help="Run browser in headed mode for troubleshooting")
 @click.argument("games", nargs=-1)
 def fetch(
     platform_name: str,
@@ -37,6 +38,7 @@ def fetch(
     game_list: str | None,
     revision: int | None,
     output_dir: str,
+    debug: bool,
     games: tuple[str, ...],
 ) -> None:
     """Search and download ROMs for one or more games."""
@@ -66,7 +68,7 @@ def fetch(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for game_name in game_names:
-        _fetch_one(game_name, platform_name, resolved_fmt, revision, out_dir)
+        _fetch_one(game_name, platform_name, resolved_fmt, revision, out_dir, debug=debug)
 
 
 def _fetch_one(
@@ -75,6 +77,7 @@ def _fetch_one(
     desired_fmt: str,
     revision_override: int | None,
     out_dir: pathlib.Path,
+    debug: bool = False,
 ) -> None:
     platform = get_platform(platform_name)
 
@@ -154,7 +157,7 @@ def _fetch_one(
     stem = best.title.replace("/", "-")
     dl_path = out_dir / f"{stem}.{source_fmt}"
     with console.status(f"Downloading to [bold]{dl_path.name}[/]..."):
-        scraper.download(best, str(dl_path))
+        scraper.download(best, str(dl_path), headless=not debug)
     console.print(f"[green]Downloaded:[/] {dl_path}")
 
     # 7. Convert if needed

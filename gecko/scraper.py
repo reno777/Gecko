@@ -10,6 +10,7 @@ import pathlib
 import sys
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 _ROMSGAMES_BASE = "https://www.romsgames.net"
 
@@ -20,6 +21,15 @@ _PLATFORM_SLUG: dict[str, str] = {
 
 # File extensions that indicate a direct ROM download response
 _ROM_EXTENSIONS = (".iso", ".rvz", ".gcz", ".zip", ".7z", ".rar")
+
+_DOWNLOAD_SELECTORS = [
+    "a:has-text('Download')",
+    "button:has-text('Download')",
+    ".download-btn",
+    "a.download",
+    "[data-action='download']",
+    "a[href*='download']",
+]
 
 
 @dataclass
@@ -98,7 +108,6 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
                     break
                 candidates.extend(page_hits)
 
-                # Advance only if a next-page control exists
                 has_next = page.query_selector(
                     "a.next, a[rel='next'], .pagination a:has-text('Next')"
                 )
@@ -123,8 +132,6 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
                 results.append(SearchResult(
                     title=title,
                     url=f"{_ROMSGAMES_BASE}{href}",
-                    # romsgames.net doesn't expose format in listings;
-                    # GameCube ROMs there are consistently .iso
                     fmt="iso",
                     size_mb=0.0,
                 ))
@@ -133,20 +140,10 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     return results
 
 
-def download(result: SearchResult, dest_path: str) -> None:
+def download(result: SearchResult, dest_path: str, headless: bool = True) -> None:
     """Navigate to result.url with Playwright and save the ROM to dest_path."""
     _check_browser()
-    _romsgames_download(result, dest_path)
-
-
-_DOWNLOAD_SELECTORS = [
-    "a:has-text('Download')",
-    "button:has-text('Download')",
-    ".download-btn",
-    "a.download",
-    "[data-action='download']",
-    "a[href*='download']",
-]
+    _romsgames_download(result, dest_path, headless=headless)
 
 
 def _attach_response_watcher(page, bucket: list[str]) -> None:
@@ -158,17 +155,18 @@ def _attach_response_watcher(page, bucket: list[str]) -> None:
     page.on("response", on_response)
 
 
-def _find_download_locator(page):
-    """Return a Locator for the first matching download button, or None.
+def _find_download_locator(page) -> tuple[Any, str] | tuple[None, None]:
+    """Return (Locator, matched_selector) for the first matching download button.
 
     Locators re-query the DOM on every interaction, so they never go stale
     after a page re-render (unlike ElementHandle from query_selector).
+    Returns (None, None) if no button is found.
     """
     for sel in _DOWNLOAD_SELECTORS:
         loc = page.locator(sel).first
         if loc.count() > 0:
-            return loc
-    return None
+            return loc, sel
+    return None, None
 
 
 def _save_from_url(url: str, dest_path: str) -> None:
@@ -178,11 +176,11 @@ def _save_from_url(url: str, dest_path: str) -> None:
             f.write(chunk)
 
 
-def _romsgames_download(result: SearchResult, dest_path: str) -> None:
+def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = True) -> None:
     from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         try:
             context = browser.new_context(accept_downloads=True)
             direct_urls: list[str] = []
@@ -190,33 +188,42 @@ def _romsgames_download(result: SearchResult, dest_path: str) -> None:
             page = context.new_page()
             _attach_response_watcher(page, direct_urls)
 
-            # Every new tab that opens is an ad popup — close it immediately.
-            context.on("page", lambda pg: pg.close())
-
             page.goto(result.url, wait_until="networkidle")
 
             if direct_urls:
                 _save_from_url(direct_urls[0], dest_path)
                 return
 
-            loc = _find_download_locator(page)
+            loc, matched_sel = _find_download_locator(page)
             if loc is None:
                 raise RuntimeError(
                     f"No download button found on {result.url}. "
                     "The site layout may have changed."
                 )
 
-            # Each click opens an ad tab (auto-closed above). After several
-            # clicks a countdown appears on the main page and the download
-            # fires automatically when it expires. Keep expect_download open
-            # for the whole sequence so it catches the event whenever it fires.
-            # Locator re-queries the DOM on each .click() so it survives the
-            # page re-render that happens when the countdown appears.
+            if not headless:
+                print(f"[debug] selector matched: {matched_sel!r}")
+                print(f"[debug] button text:      {loc.inner_text()[:80]!r}")
+
+            # Observed flow on romsgames.net:
+            #   click 1 → 1 ad tab opens
+            #   click 2 → 2 ad tabs open simultaneously
+            #   close all ad tabs → countdown appears on the main page
+            #   countdown expires → download fires on the main page
+            #
+            # We keep expect_download open across both clicks so it catches
+            # the download event whenever the countdown finishes.
             try:
                 with page.expect_download(timeout=90_000) as dl_info:
-                    for _ in range(3):
+                    for click_num in range(2):
                         loc.click()
-                        page.wait_for_timeout(1_500)
+                        # Wait for ad tabs to fully open before closing them
+                        page.wait_for_timeout(2_000)
+                        for pg in context.pages[1:]:
+                            pg.close()
+                        page.wait_for_timeout(500)
+                    # Countdown is now running on the main page.
+                    # expect_download will block here until the file arrives.
                 dl_info.value.save_as(dest_path)
                 return
             except PWTimeout:
@@ -228,7 +235,7 @@ def _romsgames_download(result: SearchResult, dest_path: str) -> None:
 
             raise RuntimeError(
                 f"Could not download from {result.url}. "
-                "The site's download flow may have changed."
+                "Try --debug to watch the browser and verify the right button is being clicked."
             )
         finally:
             browser.close()
