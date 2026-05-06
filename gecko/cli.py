@@ -1,3 +1,4 @@
+import re
 import sys
 
 if sys.version_info < (3, 11):
@@ -18,6 +19,9 @@ from gecko.utils import is_usa, parse_game_list, region_score
 
 console = Console()
 
+# Allow both -h and --help everywhere
+CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
+
 _TITLE = """
  ██████╗ ███████╗ ██████╗██╗  ██╗ ██████╗
 ██╔════╝ ██╔════╝██╔════╝██║ ██╔╝██╔═══██╗
@@ -32,19 +36,95 @@ def _print_banner() -> None:
     console.print(" [dim]ROM Downloader  •  v0.1.0  •  by Reno[/]\n")
 
 
-@click.group()
+@click.group(context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
-    """gecko — ROM search and download tool."""
+    """gecko — search and download ROMs by game name.
+
+    \b
+    gecko scrapes supported ROM sites, filters results to USA releases,
+    selects the best available revision, and saves the file in your chosen
+    format — converting automatically when needed.
+
+    \b
+    Commands:
+      fetch    Search and download one or more ROMs
+
+    \b
+    Run 'gecko COMMAND -h' for detailed help on any command.
+    """
 
 
-@cli.command()
-@click.option("--platform", "platform_name", required=True, help="Target platform (e.g. gamecube)")
-@click.option("--format", "fmt", default=None, help="Desired output format (e.g. iso, rvz, gcz)")
-@click.option("--list", "game_list", default=None, type=click.Path(exists=True), help="Path to .txt file of game names")
-@click.option("--revision", default=None, type=int, help="Force a specific revision number (e.g. 0, 1)")
-@click.option("--output-dir", default=".", show_default=True, type=click.Path(), help="Directory to save downloaded files")
-@click.option("--debug", is_flag=True, default=False, help="Run browser in headed mode for troubleshooting")
-@click.argument("games", nargs=-1)
+@cli.command(context_settings=CONTEXT_SETTINGS)
+@click.option(
+    "--platform", "platform_name",
+    required=True,
+    metavar="PLATFORM",
+    help=(
+        "The target platform to search ROMs for. "
+        "This determines which site catalogue is searched and which formats are available. "
+        "Supported: gamecube. "
+        "Example: --platform gamecube"
+    ),
+)
+@click.option(
+    "--format", "fmt",
+    default=None,
+    metavar="FORMAT",
+    help=(
+        "The desired file format for the final ROM. "
+        "If omitted, the platform default is used (gamecube → rvz). "
+        "If the requested format is not directly available on the site, gecko will "
+        "download a compatible source format and convert it automatically using DolphinTool. "
+        "Supported formats — gamecube: iso, rvz, gcz."
+    ),
+)
+@click.option(
+    "--list", "game_list",
+    default=None,
+    type=click.Path(exists=True),
+    metavar="FILE",
+    help=(
+        "Path to a plain-text file containing game names, one per line. "
+        "Lines beginning with '#' are treated as comments and ignored. "
+        "Can be combined with inline GAMES arguments — both sources are merged into one run."
+    ),
+)
+@click.option(
+    "--revision",
+    default=None,
+    type=int,
+    metavar="N",
+    help=(
+        "Pin the download to a specific revision number (e.g. 0, 1, 2). "
+        "ROM releases often ship in multiple revisions that address bugs or regional differences. "
+        "If the requested revision is not found, gecko warns you and falls back to the best available. "
+        "Omit this flag to let gecko auto-select using the priority order: "
+        "Rev 1 > Rev 0 > untagged > Rev 2+."
+    ),
+)
+@click.option(
+    "--output-dir",
+    default=".",
+    show_default=True,
+    type=click.Path(),
+    metavar="DIR",
+    help=(
+        "Directory where downloaded and converted files are saved. "
+        "Created automatically if it does not already exist. "
+        "Defaults to the current working directory."
+    ),
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help=(
+        "Launch the browser in headed (visible) mode instead of running headless. "
+        "Useful for diagnosing download failures — you can watch the browser navigate "
+        "the page in real time and see exactly where it gets stuck or clicks the wrong element."
+    ),
+)
+@click.argument("games", nargs=-1, metavar="GAMES...")
 def fetch(
     platform_name: str,
     fmt: str | None,
@@ -54,7 +134,30 @@ def fetch(
     debug: bool,
     games: tuple[str, ...],
 ) -> None:
-    """Search and download ROMs for one or more games."""
+    """Search and download ROMs for one or more games.
+
+    GAMES are fuzzy-matched against the ROM site catalogue — partial names and
+    minor misspellings are handled automatically. Quote multi-word titles to
+    prevent the shell from splitting them.
+
+    \b
+    The full download pipeline for each game:
+      1. Search the ROM site catalogue for the closest match
+      2. Filter results to USA region (falls back to any region if none found)
+      3. Match the requested format, or find a convertible source
+      4. Select the best revision (or the one you pinned with --revision)
+      5. Download the file with a live progress bar
+      6. Extract the ROM if it arrived inside a zip or 7z archive
+      7. Convert to your desired format via DolphinTool if needed
+
+    \b
+    Examples:
+      gecko fetch --platform gamecube "Mario Party 6"
+      gecko fetch --platform gamecube --format iso "Metroid Prime"
+      gecko fetch --platform gamecube --revision 1 "Super Mario Sunshine"
+      gecko fetch --platform gamecube --list my_games.txt --output-dir ~/roms
+      gecko fetch --platform gamecube --debug "Paper Mario"
+    """
 
     _print_banner()
 
@@ -63,7 +166,7 @@ def fetch(
     except ValueError as e:
         raise click.BadParameter(str(e), param_hint="--platform")
 
-    # Resolve output format
+    # Resolve output format — fall back to the platform default when --format is omitted
     resolved_fmt = fmt or platform.default_format
     if resolved_fmt not in platform.native_formats and resolved_fmt not in platform.conversions:
         raise click.BadParameter(
@@ -94,11 +197,12 @@ def _fetch_one(
     out_dir: pathlib.Path,
     debug: bool = False,
 ) -> None:
+    """Run the full search → download → extract → convert pipeline for a single game."""
     platform = get_platform(platform_name)
 
     console.rule(f"[bold]{game_name}")
 
-    # 1. Search
+    # 1. Search the ROM site for candidate matches
     with console.status(f"Searching for [bold]{game_name}[/]..."):
         results = scraper.search(platform_name, game_name)
 
@@ -106,7 +210,7 @@ def _fetch_one(
         console.print(f"[red]No results found for '{game_name}'.[/]")
         return
 
-    # 2. Region filter — prefer USA, warn if falling back
+    # 2. Region filter — prefer USA releases; warn and fall back if none found
     usa_results = [r for r in results if is_usa(r.title)]
     if not usa_results:
         console.print(
@@ -118,7 +222,7 @@ def _fetch_one(
         skipped = len(results) - len(usa_results)
         console.print(f"[dim]Filtered out {skipped} non-USA result(s).[/]")
 
-    # 3. Format filter — find results in desired_fmt or a convertible source
+    # 3. Format filter — find results in the desired format, or a convertible source
     source_fmt = desired_fmt
     format_results = [r for r in usa_results if r.fmt == desired_fmt]
     if not format_results and desired_fmt in platform.conversions:
@@ -135,7 +239,7 @@ def _fetch_one(
         )
         return
 
-    # 4. Revision selection
+    # 4. Revision selection — pin to requested revision or sort by priority
     if revision_override is not None:
         rev_tag = f"(Rev {revision_override})"
         rev_results = [r for r in format_results if rev_tag in r.title]
@@ -148,12 +252,11 @@ def _fetch_one(
     else:
         rev_results = format_results
 
-    # Sort by region score first, then revision priority
+    # Sort by region score first (exact USA wins), then revision priority
     rev_results.sort(key=lambda r: (region_score(r.title), revision_priority(r.title)))
     best = rev_results[0]
 
-    # Log if a non-default revision was automatically chosen
-    import re
+    # Inform the user if a non-Rev-1 revision was automatically chosen
     rev_match = re.search(r"\(Rev (\d+)\)", best.title, re.IGNORECASE)
     if rev_match and rev_match.group(1) != "1":
         console.print(
@@ -161,27 +264,27 @@ def _fetch_one(
             f"(Rev 1 not available).[/]"
         )
 
-    # 5. Show selection summary
+    # 5. Show a summary of the selected ROM before downloading
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_row("[dim]Selected[/]", best.title)
     table.add_row("[dim]Format[/]", source_fmt)
     table.add_row("[dim]Size[/]", f"{best.size_mb:.0f} MB" if best.size_mb else "unknown")
     console.print(table)
 
-    # 6. Download — scraper renders its own progress bar
+    # 6. Download — the scraper streams the file and renders its own progress bar
     stem = best.title.replace("/", "-")
     dl_path = out_dir / f"{stem}.{source_fmt}"
     actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
     console.print(f"[green]Downloaded:[/] {actual_dl_path}")
 
-    # 7. Extract archive if needed (zip/7z → actual ROM file)
+    # 7. Extract archive if needed — ROM sites often wrap files in zip or 7z
     if converter.is_archive(str(actual_dl_path)):
         extracted_path = pathlib.Path(converter.extract_archive(str(actual_dl_path), str(out_dir)))
         converter.cleanup(str(actual_dl_path))
         console.print(f"[green]Extracted:[/] {extracted_path}")
         actual_dl_path = extracted_path
 
-    # 8. Convert if needed (e.g. rvz → iso via dolphintool)
+    # 8. Convert to the desired format if the downloaded file differs (e.g. rvz → iso)
     actual_source_fmt = actual_dl_path.suffix.lstrip(".")
     if actual_source_fmt != desired_fmt:
         final_path = out_dir / f"{stem}.{desired_fmt}"
