@@ -100,6 +100,20 @@ def search(platform: str, game_name: str) -> list[SearchResult]:
     return _romsgames_search(slug, game_name)
 
 
+def _goto_with_retry(page, url: str, retries: int = 2, timeout: int = 60_000) -> None:
+    """Navigate to *url*, retrying up to *retries* times on timeout or network error."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return
+        except (PWTimeout, Exception):
+            if attempt == retries:
+                raise
+            page.wait_for_timeout(3_000)
+
+
 def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     from playwright.sync_api import sync_playwright
 
@@ -118,7 +132,7 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
                         f"{_ROMSGAMES_BASE}/roms/{platform_slug}/"
                         f"?letter={letter}&page={page_num}&sort=alphabetical"
                     )
-                    page.goto(url, wait_until="domcontentloaded")
+                    _goto_with_retry(page, url)
 
                     links = page.query_selector_all(f"a[href*='/{platform_slug}-rom-']")
                     if not links:
