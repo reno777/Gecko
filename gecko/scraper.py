@@ -71,10 +71,15 @@ def _search_letters(game_name: str) -> list[str]:
     """
     Return the letter(s) to query when browsing the site's alphabetical listing.
 
+    Titles starting with a digit (e.g. '007:', '1080') are filed under '0' on
+    romsgames.net rather than the first alpha character.
+
     Many ROM sites sort titles by ignoring leading articles (The, A, An), so
     'The Legend of Zelda' is filed under 'L' not 'T'.  When the title starts
     with an article we search both letters so neither possibility is missed.
     """
+    if game_name and game_name[0].isdigit():
+        return ["0"]
     first = _first_alpha(game_name)
     words = game_name.split()
     if words and words[0].lower() in ("the", "a", "an") and len(words) > 1:
@@ -147,9 +152,17 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     # (site uses " - " where queries use ":") and region tags like "(USA)" don't
     # prevent a good match or cause false positives.
     def _norm(s: str) -> str:
-        s = re.sub(r"\s*\([^)]*\)", "", s)        # strip (USA), (Rev 1), etc.
-        s = re.sub(r"[:\-_'\"/\\]", " ", s)       # punctuation → space
-        return re.sub(r"\s+", " ", s).strip().lower()
+        s = re.sub(r"\s*\([^)]*\)", "", s)         # strip (USA), (Rev 1), etc.
+        s = re.sub(r"[:\-_'\"/\\,]", " ", s)       # punctuation → space (incl. comma)
+        s = re.sub(r"\s*&\s*", " and ", s)          # & → and
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        # Strip leading/trailing articles so "The X" and "X, The" normalize identically
+        words = s.split()
+        if words and words[0] in ("the", "a", "an"):
+            words = words[1:]
+        if words and words[-1] in ("the", "a", "an"):
+            words = words[:-1]
+        return " ".join(words)
 
     norm_query = _norm(game_name)
     # Map normalised form → first original title that produces it
@@ -159,7 +172,7 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
         if n not in norm_map:
             norm_map[n] = title
 
-    close_norms = difflib.get_close_matches(norm_query, list(norm_map), n=5, cutoff=0.5)
+    close_norms = difflib.get_close_matches(norm_query, list(norm_map), n=5, cutoff=0.6)
     close = [norm_map[n] for n in close_norms]
 
     seen: set[str] = set()
