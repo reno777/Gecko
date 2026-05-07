@@ -1,8 +1,22 @@
 """
-Playwright-based ROM search and download.
+Playwright-based ROM search and download for romsgames.net.
 
-Currently implements romsgames.net. romsfun.com (Cloudflare-protected) is a
-planned second source once the core flow is validated.
+Search strategy:
+  - Navigates the site's alphabetical letter pages (paginating fully).
+  - Titles starting with a digit (e.g. "007:", "1080") are searched under "0".
+  - Articles ("The", "A", "An") are searched under both their own letter and the
+    letter of the next word, matching the site's own sorting behavior.
+  - If no match is found on the primary letter, a publisher-prefix fallback
+    searches "d" to catch Disney/Pixar and similar titles filed under the
+    publisher name rather than the game title.
+
+Matching strategy:
+  - Normalises punctuation, articles, and "&" before fuzzy scoring.
+  - Uses SequenceMatcher with autojunk=False and a query-coverage bonus so that
+    short queries (e.g. "Chibi-Robo!") match longer site titles correctly.
+  - Rejects matches where series numbers differ (e.g. "Spider-Man" vs "Spider-Man 2").
+
+romsfun.com (Cloudflare-protected) is a planned second source.
 """
 
 import difflib

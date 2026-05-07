@@ -36,7 +36,7 @@ _TITLE = """
 
 def _print_banner() -> None:
     console.print(_TITLE, style="bold green")
-    console.print(" [dim]ROM Downloader  •  v0.2.0  •  by Reno[/]\n")
+    console.print(" [dim]ROM Downloader  •  v0.3.0  •  by Reno[/]\n")
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
