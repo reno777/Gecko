@@ -100,6 +100,20 @@ def search(platform: str, game_name: str) -> list[SearchResult]:
     return _romsgames_search(slug, game_name)
 
 
+def _digits_compatible(query_digits: set[str], match_digits: set[str]) -> bool:
+    """
+    Return False when a numbered query would resolve to a game with a different
+    series number, e.g. "Resident Evil 0" → "Resident Evil 4", or when an
+    unnumbered query would silently grab a numbered sequel, e.g. "Spider-Man"
+    → "Spider-Man 2".
+    """
+    if bool(query_digits) != bool(match_digits):
+        return False  # one is numbered, the other is not
+    if query_digits and match_digits != query_digits:
+        return False  # different numbers in the series
+    return True
+
+
 def _goto_with_retry(page, url: str, retries: int = 2, timeout: int = 60_000) -> None:
     """Navigate to *url*, retrying up to *retries* times on timeout or network error."""
     from playwright.sync_api import TimeoutError as PWTimeout
@@ -180,7 +194,35 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
         if n not in norm_map:
             norm_map[n] = title
 
-    close_norms = difflib.get_close_matches(norm_query, list(norm_map), n=5, cutoff=0.6)
+    # Score each candidate using both similarity ratio and query coverage.
+    # autojunk=False: prevents common chars from being ignored, which hurts
+    #   short queries against long titles (e.g. "Finding Nemo" vs "Disney/Pixar…").
+    # Query coverage: fraction of query chars matched inside the candidate.
+    #   Boosted by 0.9 so that short queries embedded in longer titles
+    #   (e.g. "Chibi-Robo!" inside "Chibi-Robo! Plug Into Adventure!") still
+    #   score above the threshold even when the raw ratio is low.
+    scored: list[tuple[float, str]] = []
+    for norm_candidate in norm_map:
+        sm = difflib.SequenceMatcher(None, norm_query, norm_candidate, autojunk=False)
+        ratio = sm.ratio()
+        matched = sum(t.size for t in sm.get_matching_blocks())
+        coverage = (matched / len(norm_query) * 0.9) if norm_query else 0.0
+        score = max(ratio, coverage)
+        if score >= 0.6:
+            scored.append((score, norm_candidate))
+    scored.sort(reverse=True)
+    close_norms = [n for _, n in scored[:5]]
+
+    # Reject matches with incompatible series numbers so that unnumbered queries
+    # (e.g. "Spider-Man") don't resolve to a numbered sequel ("Spider-Man 2"),
+    # and numbered queries with different digits (e.g. "Resident Evil 0" vs "4")
+    # correctly show as not found rather than downloading the wrong game.
+    query_digits = set(re.findall(r'\b\d+\b', norm_query))
+    close_norms = [
+        n for n in close_norms
+        if _digits_compatible(query_digits, set(re.findall(r'\b\d+\b', n)))
+    ]
+
     close = [norm_map[n] for n in close_norms]
 
     seen: set[str] = set()
