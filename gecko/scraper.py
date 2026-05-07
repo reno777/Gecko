@@ -135,50 +135,12 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     candidates: list[tuple[str, str]] = []  # (title, href)
     seen_hrefs: set[str] = set()             # dedup across multiple letter pages
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page()
-            for letter in letters:
-                page_num = 1
-                while True:
-                    url = (
-                        f"{_ROMSGAMES_BASE}/roms/{platform_slug}/"
-                        f"?letter={letter}&page={page_num}&sort=alphabetical"
-                    )
-                    _goto_with_retry(page, url)
-
-                    links = page.query_selector_all(f"a[href*='/{platform_slug}-rom-']")
-                    if not links:
-                        break
-
-                    page_hits: list[tuple[str, str]] = []
-                    for link in links:
-                        title = link.inner_text().strip()
-                        href = link.get_attribute("href")
-                        if title and href and href not in seen_hrefs:
-                            page_hits.append((title, href))
-                            seen_hrefs.add(href)
-
-                    if not page_hits:
-                        break
-                    candidates.extend(page_hits)
-                    page_num += 1
-        finally:
-            browser.close()
-
-    if not candidates:
-        return []
-
-    # Normalize titles before fuzzy-matching so that punctuation differences
-    # (site uses " - " where queries use ":") and region tags like "(USA)" don't
-    # prevent a good match or cause false positives.
+    # ── normalisation (defined here so the fallback logic can use it) ─────────
     def _norm(s: str) -> str:
         s = re.sub(r"\s*\([^)]*\)", "", s)         # strip (USA), (Rev 1), etc.
         s = re.sub(r"[:\-_'\"/\\,]", " ", s)       # punctuation → space (incl. comma)
         s = re.sub(r"\s*&\s*", " and ", s)          # & → and
         s = re.sub(r"\s+", " ", s).strip().lower()
-        # Strip leading/trailing articles so "The X" and "X, The" normalize identically
         words = s.split()
         if words and words[0] in ("the", "a", "an"):
             words = words[1:]
@@ -187,42 +149,80 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
         return " ".join(words)
 
     norm_query = _norm(game_name)
-    # Map normalised form → first original title that produces it
-    norm_map: dict[str, str] = {}
-    for title, _ in candidates:
-        n = _norm(title)
-        if n not in norm_map:
-            norm_map[n] = title
-
-    # Score each candidate using both similarity ratio and query coverage.
-    # autojunk=False: prevents common chars from being ignored, which hurts
-    #   short queries against long titles (e.g. "Finding Nemo" vs "Disney/Pixar…").
-    # Query coverage: fraction of query chars matched inside the candidate.
-    #   Boosted by 0.9 so that short queries embedded in longer titles
-    #   (e.g. "Chibi-Robo!" inside "Chibi-Robo! Plug Into Adventure!") still
-    #   score above the threshold even when the raw ratio is low.
-    scored: list[tuple[float, str]] = []
-    for norm_candidate in norm_map:
-        sm = difflib.SequenceMatcher(None, norm_query, norm_candidate, autojunk=False)
-        ratio = sm.ratio()
-        matched = sum(t.size for t in sm.get_matching_blocks())
-        coverage = (matched / len(norm_query) * 0.9) if norm_query else 0.0
-        score = max(ratio, coverage)
-        if score >= 0.6:
-            scored.append((score, norm_candidate))
-    scored.sort(reverse=True)
-    close_norms = [n for _, n in scored[:5]]
-
-    # Reject matches with incompatible series numbers so that unnumbered queries
-    # (e.g. "Spider-Man") don't resolve to a numbered sequel ("Spider-Man 2"),
-    # and numbered queries with different digits (e.g. "Resident Evil 0" vs "4")
-    # correctly show as not found rather than downloading the wrong game.
     query_digits = set(re.findall(r'\b\d+\b', norm_query))
-    close_norms = [
-        n for n in close_norms
-        if _digits_compatible(query_digits, set(re.findall(r'\b\d+\b', n)))
-    ]
 
+    def _top_matches() -> tuple[list[str], dict[str, str]]:
+        """Score current candidates; return (close_norms, norm_map)."""
+        norm_map: dict[str, str] = {}
+        for title, _ in candidates:
+            n = _norm(title)
+            if n not in norm_map:
+                norm_map[n] = title
+        scored: list[tuple[float, str]] = []
+        for nc in norm_map:
+            sm = difflib.SequenceMatcher(None, norm_query, nc, autojunk=False)
+            ratio = sm.ratio()
+            matched = sum(t.size for t in sm.get_matching_blocks())
+            coverage = (matched / len(norm_query) * 0.9) if norm_query else 0.0
+            score = max(ratio, coverage)
+            if score >= 0.6:
+                scored.append((score, nc))
+        scored.sort(reverse=True)
+        close = [n for _, n in scored[:5]]
+        close = [
+            n for n in close
+            if _digits_compatible(query_digits, set(re.findall(r'\b\d+\b', n)))
+        ]
+        return close, norm_map
+
+    # ── page loading ──────────────────────────────────────────────────────────
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+
+            def _load_letter(letter: str) -> None:
+                page_num = 1
+                while True:
+                    url = (
+                        f"{_ROMSGAMES_BASE}/roms/{platform_slug}/"
+                        f"?letter={letter}&page={page_num}&sort=alphabetical"
+                    )
+                    _goto_with_retry(page, url)
+                    links = page.query_selector_all(f"a[href*='/{platform_slug}-rom-']")
+                    if not links:
+                        break
+                    page_hits: list[tuple[str, str]] = []
+                    for link in links:
+                        title = link.inner_text().strip()
+                        href = link.get_attribute("href")
+                        if title and href and href not in seen_hrefs:
+                            page_hits.append((title, href))
+                            seen_hrefs.add(href)
+                    if not page_hits:
+                        break
+                    candidates.extend(page_hits)
+                    page_num += 1
+
+            for letter in letters:
+                _load_letter(letter)
+
+            # Publisher-prefix fallback: many ROM sites file Disney/Pixar,
+            # DreamWorks, etc. titles under the publisher name (starting with 'd')
+            # rather than the game title.  If we got no fuzzy match on the primary
+            # letter(s), try 'd' before giving up — the browser is still open so
+            # there is no extra startup cost.
+            if not _top_matches()[0] and "d" not in letters:
+                _load_letter("d")
+
+        finally:
+            browser.close()
+
+    # ── fuzzy matching ────────────────────────────────────────────────────────
+    if not candidates:
+        return []
+
+    close_norms, norm_map = _top_matches()
     close = [norm_map[n] for n in close_norms]
 
     seen: set[str] = set()
