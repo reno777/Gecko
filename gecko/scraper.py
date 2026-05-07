@@ -149,12 +149,6 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
                     if not page_hits:
                         break
                     candidates.extend(page_hits)
-
-                    has_next = page.query_selector(
-                        "a.next, a[rel='next'], .pagination a:has-text('Next')"
-                    )
-                    if not has_next:
-                        break
                     page_num += 1
         finally:
             browser.close()
