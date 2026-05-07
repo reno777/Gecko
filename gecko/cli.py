@@ -36,7 +36,7 @@ _TITLE = """
 
 def _print_banner() -> None:
     console.print(_TITLE, style="bold green")
-    console.print(" [dim]ROM Downloader  •  v0.1.0  •  by Reno[/]\n")
+    console.print(" [dim]ROM Downloader  •  v0.2.0  •  by Reno[/]\n")
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -121,6 +121,18 @@ def _download_one(
     Download, extract, and convert a single resolved ROM.
     Prints a progress header and status updates. Called sequentially by the queue worker.
     """
+    # Sanitize the filename — colons and other special chars break paths on some systems
+    stem = _sanitize_stem(best.title)
+
+    # Check before printing anything — skip immediately if already downloaded
+    existing = _already_downloaded(out_dir, best.title, desired_fmt)
+    if existing:
+        console.print(
+            f"[yellow]⊘  Already downloaded:[/] [bold]{game_name}[/]\n"
+            f"   [dim]{existing.name}[/]"
+        )
+        return
+
     console.rule(f"[bold]{game_name}")
 
     # Inform the user when a conversion will happen after download
@@ -143,17 +155,6 @@ def _download_one(
     table.add_row("[dim]Format[/]", source_fmt)
     table.add_row("[dim]Size[/]", f"{best.size_mb:.0f} MB" if best.size_mb else "unknown")
     console.print(table)
-
-    # Sanitize the filename — colons and other special chars break paths on some systems
-    stem = _sanitize_stem(best.title)
-
-    # Skip if a matching file already exists — uses fuzzy name comparison so that
-    # differences like punctuation, region tags, or .nkit.iso double-extensions don't
-    # cause a false miss against the exact stem we would have written.
-    existing = _already_downloaded(out_dir, best.title, desired_fmt)
-    if existing:
-        console.print(f"[dim]Already exists, skipping:[/] {existing.name}")
-        return
 
     dl_path = out_dir / f"{stem}.{source_fmt}"
 
