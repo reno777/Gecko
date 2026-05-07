@@ -158,7 +158,7 @@ def _download_one(
 
     dl_path = out_dir / f"{stem}.{source_fmt}"
 
-    # Download — scraper streams the file and renders its own progress bar
+    console.print("[dim]Starting download (site uses a countdown — may take up to 60 s before transfer begins)...[/]")
     actual_dl_path = pathlib.Path(scraper.download(best, str(dl_path), headless=not debug))
     console.print(f"[green]Downloaded:[/] {actual_dl_path}")
 

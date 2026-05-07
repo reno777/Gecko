@@ -290,7 +290,7 @@ def _stream_download(url: str, dest_path: str, extra_headers: dict | None = None
         headers.update(extra_headers)
 
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         total = int(resp.headers.get("Content-Length", 0)) or None
         with Progress(
             TextColumn("[cyan]{task.description}"),
@@ -320,6 +320,7 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             page = context.new_page()
             _attach_response_watcher(page, direct_urls)
 
+            print("  → Loading game page...", flush=True)
             page.goto(result.url, wait_until="domcontentloaded")
             page.wait_for_timeout(2_000)  # let JS render the download button
 
@@ -342,6 +343,7 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
             #   click 2 → 2 ad tabs open simultaneously
             #   close all ad tabs → countdown appears on the main page
             #   countdown expires → download fires on the main page
+            print("  → Clicking download button (waiting for site countdown)...", flush=True)
             try:
                 with page.expect_download(timeout=90_000) as dl_info:
                     for _ in range(2):
@@ -352,6 +354,7 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
                         page.wait_for_timeout(500)
 
                 dl = dl_info.value
+                print("  → Download triggered.", flush=True)
 
                 # Use suggested_filename to get the real extension (may be .zip, .7z, etc.)
                 suggested = dl.suggested_filename
@@ -376,7 +379,9 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
                     except Exception:
                         pass  # stream failed — let Playwright save it below
 
-                # Fallback: Playwright writes the already-captured download to disk
+                # Fallback: Playwright writes the already-captured download to disk.
+                # No streaming progress bar here — Playwright manages the file internally.
+                print(f"  → Saving {pathlib.Path(actual_path).name} via browser...", flush=True)
                 dl.save_as(actual_path)
                 return actual_path
 
