@@ -123,8 +123,24 @@ def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     if not candidates:
         return []
 
-    titles = [t for t, _ in candidates]
-    close = difflib.get_close_matches(game_name, titles, n=5, cutoff=0.4)
+    # Normalize titles before fuzzy-matching so that punctuation differences
+    # (site uses " - " where queries use ":") and region tags like "(USA)" don't
+    # prevent a good match or cause false positives.
+    def _norm(s: str) -> str:
+        s = re.sub(r"\s*\([^)]*\)", "", s)        # strip (USA), (Rev 1), etc.
+        s = re.sub(r"[:\-_'\"/\\]", " ", s)       # punctuation → space
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    norm_query = _norm(game_name)
+    # Map normalised form → first original title that produces it
+    norm_map: dict[str, str] = {}
+    for title, _ in candidates:
+        n = _norm(title)
+        if n not in norm_map:
+            norm_map[n] = title
+
+    close_norms = difflib.get_close_matches(norm_query, list(norm_map), n=5, cutoff=0.5)
+    close = [norm_map[n] for n in close_norms]
 
     seen: set[str] = set()
     results: list[SearchResult] = []
@@ -261,20 +277,23 @@ def _romsgames_download(result: SearchResult, dest_path: str, headless: bool = T
                 else:
                     actual_path = dest_path
 
-                # Prefer streaming directly from the URL for speed + progress.
-                # dl.url is the real file URL; fall back to Playwright save_as only
-                # if it's a blob or internal URL.
+                # Try streaming directly for speed and a live progress bar.
+                # If the server rejects the out-of-browser request (e.g. HTTP 400)
+                # fall back to letting Playwright save the captured download instead.
                 file_url = direct_urls[0] if direct_urls else dl.url
                 if file_url and not file_url.startswith("blob:"):
-                    cookies = context.cookies()
-                    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                    return _stream_download(
-                        file_url,
-                        actual_path,
-                        extra_headers={"Referer": result.url, "Cookie": cookie_str},
-                    )
+                    try:
+                        cookies = context.cookies()
+                        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                        return _stream_download(
+                            file_url,
+                            actual_path,
+                            extra_headers={"Referer": result.url, "Cookie": cookie_str},
+                        )
+                    except Exception:
+                        pass  # stream failed — let Playwright save it below
 
-                # Blob URL or unknown — let Playwright save it and show a fallback message
+                # Fallback: Playwright writes the already-captured download to disk
                 dl.save_as(actual_path)
                 return actual_path
 

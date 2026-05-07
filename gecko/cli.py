@@ -128,6 +128,13 @@ def _download_one(
 
     # Sanitize the filename — colons and other special chars break paths on some systems
     stem = _sanitize_stem(best.title)
+
+    # Skip if the final file already exists in the output directory
+    final_check = out_dir / f"{stem}.{desired_fmt}"
+    if final_check.exists():
+        console.print(f"[dim]Already exists, skipping:[/] {final_check.name}")
+        return
+
     dl_path = out_dir / f"{stem}.{source_fmt}"
 
     # Download — scraper streams the file and renders its own progress bar
