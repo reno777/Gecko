@@ -67,6 +67,22 @@ def _first_alpha(name: str) -> str:
     return "a"
 
 
+def _search_letters(game_name: str) -> list[str]:
+    """
+    Return the letter(s) to query when browsing the site's alphabetical listing.
+
+    Many ROM sites sort titles by ignoring leading articles (The, A, An), so
+    'The Legend of Zelda' is filed under 'L' not 'T'.  When the title starts
+    with an article we search both letters so neither possibility is missed.
+    """
+    first = _first_alpha(game_name)
+    words = game_name.split()
+    if words and words[0].lower() in ("the", "a", "an") and len(words) > 1:
+        alt = _first_alpha(words[1])
+        return [first, alt] if alt != first else [first]
+    return [first]
+
+
 def search(platform: str, game_name: str) -> list[SearchResult]:
     """
     Return candidate SearchResults for *game_name* on *platform*,
@@ -82,42 +98,45 @@ def search(platform: str, game_name: str) -> list[SearchResult]:
 def _romsgames_search(platform_slug: str, game_name: str) -> list[SearchResult]:
     from playwright.sync_api import sync_playwright
 
-    first_letter = _first_alpha(game_name)
+    letters = _search_letters(game_name)
     candidates: list[tuple[str, str]] = []  # (title, href)
+    seen_hrefs: set[str] = set()             # dedup across multiple letter pages
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page()
-            page_num = 1
-            while True:
-                url = (
-                    f"{_ROMSGAMES_BASE}/roms/{platform_slug}/"
-                    f"?letter={first_letter}&page={page_num}&sort=alphabetical"
-                )
-                page.goto(url, wait_until="domcontentloaded")
+            for letter in letters:
+                page_num = 1
+                while True:
+                    url = (
+                        f"{_ROMSGAMES_BASE}/roms/{platform_slug}/"
+                        f"?letter={letter}&page={page_num}&sort=alphabetical"
+                    )
+                    page.goto(url, wait_until="domcontentloaded")
 
-                links = page.query_selector_all(f"a[href*='/{platform_slug}-rom-']")
-                if not links:
-                    break
+                    links = page.query_selector_all(f"a[href*='/{platform_slug}-rom-']")
+                    if not links:
+                        break
 
-                page_hits: list[tuple[str, str]] = []
-                for link in links:
-                    title = link.inner_text().strip()
-                    href = link.get_attribute("href")
-                    if title and href:
-                        page_hits.append((title, href))
+                    page_hits: list[tuple[str, str]] = []
+                    for link in links:
+                        title = link.inner_text().strip()
+                        href = link.get_attribute("href")
+                        if title and href and href not in seen_hrefs:
+                            page_hits.append((title, href))
+                            seen_hrefs.add(href)
 
-                if not page_hits:
-                    break
-                candidates.extend(page_hits)
+                    if not page_hits:
+                        break
+                    candidates.extend(page_hits)
 
-                has_next = page.query_selector(
-                    "a.next, a[rel='next'], .pagination a:has-text('Next')"
-                )
-                if not has_next:
-                    break
-                page_num += 1
+                    has_next = page.query_selector(
+                        "a.next, a[rel='next'], .pagination a:has-text('Next')"
+                    )
+                    if not has_next:
+                        break
+                    page_num += 1
         finally:
             browser.close()
 
