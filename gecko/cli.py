@@ -46,6 +46,24 @@ def _sanitize_stem(title: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "-", title).strip()
 
 
+def _already_downloaded(out_dir: pathlib.Path, title: str, fmt: str) -> pathlib.Path | None:
+    """
+    Return the first file in out_dir that looks like this game in the given format, or None.
+
+    Uses alphanumeric-only comparison so that differences in punctuation, region
+    tags, or double extensions (e.g. .nkit.iso) don't cause a false miss.
+    """
+    def _alnum(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    norm = _alnum(_sanitize_stem(title))
+    for f in out_dir.glob(f"*.{fmt}"):
+        # Compare only the part before the first dot to handle .nkit.iso etc.
+        if norm in _alnum(f.name.split(".")[0]):
+            return f
+    return None
+
+
 def _find_best(
     game_name: str,
     platform_name: str,
@@ -129,10 +147,12 @@ def _download_one(
     # Sanitize the filename — colons and other special chars break paths on some systems
     stem = _sanitize_stem(best.title)
 
-    # Skip if the final file already exists in the output directory
-    final_check = out_dir / f"{stem}.{desired_fmt}"
-    if final_check.exists():
-        console.print(f"[dim]Already exists, skipping:[/] {final_check.name}")
+    # Skip if a matching file already exists — uses fuzzy name comparison so that
+    # differences like punctuation, region tags, or .nkit.iso double-extensions don't
+    # cause a false miss against the exact stem we would have written.
+    existing = _already_downloaded(out_dir, best.title, desired_fmt)
+    if existing:
+        console.print(f"[dim]Already exists, skipping:[/] {existing.name}")
         return
 
     dl_path = out_dir / f"{stem}.{source_fmt}"
