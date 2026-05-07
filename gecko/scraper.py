@@ -7,6 +7,7 @@ planned second source once the core flow is validated.
 
 import difflib
 import pathlib
+import re
 import sys
 import urllib.request
 from dataclasses import dataclass
